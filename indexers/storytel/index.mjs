@@ -49,6 +49,14 @@ const MEDIA_ACCEPT = 'audio/mp4;codecs=mp4a.40.2,audio/mpeg';
 /** A resource version the bookshelf endpoint accepts from a client that has never synced. */
 const EMPTY_RESOURCE_VERSION = 'AAUAAAaaaaaaaaaaaaaAAAAaaaaaaaAaAAaAAAaaaaaaaaAAAAaaaaaaAAAAAAaaaaa=';
 
+/**
+ * Storytel serves audiobooks at about 64 kbps, MP3 or AAC alike, and publishes the exact duration,
+ * so a size estimate costs no request. Measured 2026-10-07: 492,823,922 bytes actual against
+ * 500,832,000 estimated for a 17.39 h book. Search publishes no size of its own, and BookOrbit
+ * scores a release with none as if it might be a sample.
+ */
+const BYTES_PER_SECOND = (64 * 1000) / 8;
+
 /** Ten per page; two pages is plenty for one request and still only two anonymous calls. */
 const MAX_SEARCH_PAGES = 2;
 const DEFAULT_STORE = 'STHP-SE';
@@ -61,6 +69,13 @@ const BLOCK_COOLDOWN_MS = 60 * 60 * 1000;
 /** How long a rejected password is left alone, so a typo cannot hammer the login into a lockout. */
 const LOGIN_COOLDOWN_MS = 15 * 60 * 1000;
 
+/**
+ * BookOrbit resolves a release both when an approver opens its file list and again at the grab once
+ * its own one-minute cache has lapsed. Without this the two cost two audio requests and two slots of
+ * the daily cap for one book. Kept well inside the lifetime of Storytel's signed links.
+ */
+const RESOLVED_TTL_MS = 10 * 60 * 1000;
+
 /** Per indexer row: the live session, the grab history and any cooldown. In memory on purpose. */
 const accounts = new Map();
 
@@ -68,7 +83,7 @@ function account(config) {
   let state = accounts.get(config.id);
   const email = String(config.settings?.email ?? '').trim();
   if (!state || state.email !== email || state.password !== config.credential) {
-    state = { email, password: config.credential, jwt: null, grabs: [], cooldownUntil: 0, cooldownReason: '', queue: Promise.resolve() };
+    state = { email, password: config.credential, jwt: null, grabs: [], resolved: new Map(), cooldownUntil: 0, cooldownReason: '', queue: Promise.resolve() };
     accounts.set(config.id, state);
   }
   return state;
@@ -76,7 +91,7 @@ function account(config) {
 
 export default {
   apiVersion: 1,
-  version: '0.2.0',
+  version: '0.2.1',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/secunit404/bookorbit-storytel/main/updates/storytel.json',
     ed25519PublicKey: 'c-DCwpvrXQunD95ec-6tp6BM4PVY-CAHudw594Z9WH4',
@@ -182,6 +197,10 @@ async function resolveOne(release, config, host, state) {
   if (!/^\d+$/.test(consumableId)) throw host.fail('error', `"${release.title}" carries no Storytel id`);
 
   const now = Date.now();
+  for (const [id, entry] of state.resolved) if (entry.at <= now - RESOLVED_TTL_MS) state.resolved.delete(id);
+  const cached = state.resolved.get(consumableId);
+  if (cached) return cached.file;
+
   if (state.cooldownUntil > now) {
     throw host.fail('throttled', `${state.cooldownReason} Waiting until ${new Date(state.cooldownUntil).toISOString()} before contacting Storytel again.`);
   }
@@ -216,7 +235,7 @@ async function resolveOne(release, config, host, state) {
   const { extension, sizeBytes } = await probeAudio(host, signedUrl);
   host.logger.log(`resolved ${consumableId} as ${extension} with ${chapters.length} chapters`);
 
-  return {
+  const file = {
     url: signedUrl,
     fileName: `${sanitizeName(title)}.${extension}`,
     sizeBytes,
@@ -236,6 +255,8 @@ async function resolveOne(release, config, host, state) {
       coverUrl: text(details.cover?.url) ?? undefined,
     },
   };
+  state.resolved.set(consumableId, { file, at: Date.now() });
+  return file;
 }
 
 async function searchCatalogue(host, store, text, languages, limit, signal) {
@@ -292,7 +313,7 @@ function toRelease(item) {
     language: text(item.language) ?? undefined,
     // What lands in the library once the audiobook-assembly patch has built it, not what Storytel sends.
     format: 'm4b',
-    sizeBytes: null,
+    sizeBytes: durationSeconds ? durationSeconds * BYTES_PER_SECOND : null,
     seeders: null,
     leechers: null,
     publishedAt: text(abook.releaseDate) ?? undefined,

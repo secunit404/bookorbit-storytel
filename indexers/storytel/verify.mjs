@@ -66,7 +66,7 @@ function accountRoutes(over = {}) {
           return json({ resourceVersion: 'rv-2', items: Object.fromEntries(ids.map((id) => [id, { action: 'SET', model: { state: 'WILL_CONSUME' } }])) });
         }),
     ],
-    ['/assets/v2/consumables/10392381/url', over.url ?? (() => json({ result: { signedUrl: SIGNED } }))],
+    ['/url', over.url ?? (() => json({ result: { signedUrl: SIGNED } }))],
     ['cdn.storytel.example', over.cdn ?? (() => json({}, 500))],
     [
       '/playback-metadata/consumable/',
@@ -126,6 +126,7 @@ console.log('search');
   ok('never sends the account', !JSON.stringify(host.reqs[0].init).toLowerCase().includes('authorization'));
   ok('maps the real result', found.length === 1 && found[0].guid === '10392381' && found[0].bookTitle === 'Mördare utan ansikte', found);
   ok('states author, language and duration', found[0].author === 'Henning Mankell' && found[0].language === 'sv' && found[0].audio.durationSeconds === 32858);
+  ok('estimates the size from the duration at 64 kbps', found[0].sizeBytes === 32858 * 8000, found[0].sizeBytes);
   ok('decorates the title with series and narrator', found[0].title.includes('Wallander 1') && found[0].title.includes('Stefan Sauk'), found[0].title);
 }
 {
@@ -177,14 +178,14 @@ console.log('resolveFile');
   const host = makeHost(accountRoutes());
   await plugin.resolveFile(release, config, host, signal());
   const before = host.reqs.length;
-  const refused = await plugin.resolveFile(release, config, host, signal()).catch((e) => e);
+  const refused = await plugin.resolveFile({ ...release, guid: '10392382' }, config, host, signal()).catch((e) => e);
   ok('refuses past the daily cap without contacting Storytel', refused.failure === 'throttled' && host.reqs.length === before, refused.message);
 }
 {
   const config = cfg({ minSecondsBetweenGrabs: 3600 });
   const host = makeHost(accountRoutes());
   await plugin.resolveFile(release, config, host, signal());
-  const refused = await plugin.resolveFile(release, config, host, signal()).catch((e) => e);
+  const refused = await plugin.resolveFile({ ...release, guid: '10392382' }, config, host, signal()).catch((e) => e);
   ok('spaces grabs out', refused.failure === 'throttled' && /wait/.test(refused.message), refused.message);
 }
 {
@@ -192,8 +193,16 @@ console.log('resolveFile');
   const host = makeHost(accountRoutes());
   await plugin.resolveFile(release, config, host, signal());
   await new Promise((resolve) => setTimeout(resolve, 1100));
-  await plugin.resolveFile(release, config, host, signal());
+  await plugin.resolveFile({ ...release, guid: '10392382' }, config, host, signal());
   ok('reuses the session across grabs', host.reqs.filter((r) => r.url.includes('/api/login.action')).length === 1);
+}
+{
+  const config = cfg({ maxGrabsPerDay: 1, minSecondsBetweenGrabs: 3600 });
+  const host = makeHost(accountRoutes());
+  const first = await plugin.resolveFile(release, config, host, signal());
+  const count = host.reqs.length;
+  const again = await plugin.resolveFile(release, config, host, signal());
+  ok('resolves the same book again from memory, inside the limits', again.url === first.url && host.reqs.length === count);
 }
 {
   let calls = 0;
